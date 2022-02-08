@@ -53,10 +53,73 @@ def send_to_front(producer_data):
     from_azat = json.loads(to_azat.text)
     print(from_azat)
 
+def search_and_send(pgconnectionString, log, crops_folder, threshold, faiss_index, original_image_id, embeddings_list, faces_list, camera_id):
+    start = time.time()
+    powerPostgre = PowerPost(pgconnectionString[0], pgconnectionString[1], pgconnectionString[2], pgconnectionString[3], pgconnectionString[4])
+
+    face_cnt = 0
+    for embedding in embeddings_list:
+        distances, indexes = powerPostgre.search_from_gbdfl_faiss(faiss_index, embedding, 1, threshold)
+        if indexes is not None and distances[0][0] > float(threshold)/100:
+            # print("FIRST PRINT FROM insert to db:", distances, indexes)
+            ids = tuple(list(map(str,indexes[0])))
+            similarity = float(distances[0])
+            with_zeros = []
+            str_ids = list(map(str, indexes[0]))
+            for i in str_ids:
+                while len(i) < 9:
+                    i = "0" + i
+                with_zeros.append(i)
+            from_gbdfl = powerPostgre.get_info_from_unique_ud_gr(tuple(with_zeros))
+            # from_gbdfl = powerPostgre.get_blob_from_ud_gr(ud_code)
+            result_dict = {}
+
+            if len(from_gbdfl) > 0:                    
+                image_path = os.path.join(crops_folder, original_image_id + '_' + str(face_cnt) + '.jpg')
+                img = cv2.imread(image_path)
+
+                result_dict['similarity'] = int(round(similarity*100, 2))  # format(from_gbdfl['lst'][1], '.2f')
+                result_dict['iin'] = from_gbdfl[0]
+                result_dict['surname'] = from_gbdfl[1]
+                result_dict['firstname'] = from_gbdfl[2]
+                if from_gbdfl[3] is None:
+                    result_dict['secondname'] = ''
+                else:
+                    result_dict['secondname'] = from_gbdfl[3]
+                
+                result_dict['ud_number'] = from_gbdfl[4]
+                crop_time = datetime.now()
+                result_dict['timestamp'] = crop_time
+                print(result_dict)
+                strimg = base64.b64encode(cv2.imencode('.jpg', img)[1]).decode()
+                producer_data = {'app': 'detection',
+                                'command': 'new_face_detected',
+                                'crop': strimg,
+                                'meta': result_dict,
+                                'source': camera_id,
+                                'timestamp_sent': datetime.now().strftime("%d-%m-%Y, %H:%M:%S")
+                                }
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                to_azat = requests.post('http://10.150.34.13:10100/api/detect-faces-live-ready', headers=headers, data={'data': json.dumps(producer_data, default = defaultconverter)})
+                # from_azat = json.loads(to_azat.text)
+                # print(from_azat)
+                # thread = clientThread(send_to_front, [producer_data])
+                # thread.start()
+                # thread.join()
+            else:
+                print('Not in database')
+                continue
+            log_message = {'rtsp': camera_id, 'message': 'Successfully sent', 'table_name': 'fr.unique_ud_gr', 'ud_code': with_zeros, 'time_spent': time.time() - start}
+            log.debug(log_message)
+        else:
+            print('Not PASSED THRESHOLD', distances, indexes, 'TIME SPENT:', time.time() - start)
+            log_message = {'rtsp': camera_id, 'message': 'Person Not in Database', 'table_name': 'fr.unique_ud_gr', 'ud_code': None}
+            log.debug(log_message)
+        face_cnt += 1
 
 def insertion():
     FLAGS = None
-    parser = configargparse.ArgParser() #(default_config_files=[conf_file])
+    parser = configargparse.ArgParser()
     parser.add('-c', '--my-config', required=False, is_config_file=True, help='config file path')
     #parser = configargparse.ArgParser(default_config_files=[conf_file])
     parser.add('--psql_server', type=str, required=False, help='Postgres server URL.')
@@ -77,13 +140,13 @@ def insertion():
     FLAGS = parser.parse_args()
 
     pgconnectionString = [FLAGS.psql_server, FLAGS.psql_server_port, FLAGS.psql_db, FLAGS.psql_user, FLAGS.psql_user_pass]
-    powerPostgre = PowerPost(pgconnectionString[0], pgconnectionString[1], pgconnectionString[2], pgconnectionString[3], pgconnectionString[4])
+    # powerPostgre = PowerPost(pgconnectionString[0], pgconnectionString[1], pgconnectionString[2], pgconnectionString[3], pgconnectionString[4])
 
     faiss_index = fs.read_index('/final_index/populated.index', fs.IO_FLAG_ONDISK_SAME_DIR)
 
     threshold = FLAGS.threshold
 
-    log = get_logger('cameras')    
+    log = get_logger('cameras')
 
     while True:
         try:
@@ -101,69 +164,72 @@ def insertion():
             log.debug(log_message)
             print (e)    
 
-    for event in consumer:
-        start = time.time()
+    for event in consumer:        
         original_image_id, embeddings_list, faces_list, camera_id = preprocessing(event.value)
-        # red_id, similarity = powerPostgre.search_from_blacklist(vector, 60)
-        face_cnt = 0
-        for embedding in embeddings_list:
-            distances, indexes = powerPostgre.search_from_gbdfl_faiss(faiss_index, embedding, 1, threshold)
-            # print('Distances, indexes:', distances, indexes)
-            if indexes is not None and distances[0][0] > float(threshold)/100:
-                # print("FIRST PRINT FROM insert to db:", distances, indexes)
-                ids = tuple(list(map(str,indexes[0])))
-                similarity = float(distances[0])
-                with_zeros = []
-                str_ids = list(map(str, indexes[0]))
-                for i in str_ids:
-                    while len(i) < 9:
-                        i = "0" + i
-                    with_zeros.append(i)
-                from_gbdfl = powerPostgre.get_info_from_unique_ud_gr(tuple(with_zeros))
-                # from_gbdfl = powerPostgre.get_blob_from_ud_gr(ud_code)
-                result_dict = {}
+        # search_and_send(pgconnectionString, log, crops_folder, original_image_id, embeddings_list, faces_list, camera_id)
+        thread = clientThread(search_and_send, [pgconnectionString, log, FLAGS.crops_folder, threshold, faiss_index, original_image_id, embeddings_list, faces_list, camera_id])
+        thread.start()
+        thread.join()
 
-                if len(from_gbdfl) > 0:                    
-                    image_path = os.path.join(FLAGS.crops_folder, original_image_id + '_' + str(face_cnt) + '.jpg')
-                    img = cv2.imread(image_path)
+        # face_cnt = 0
+        # for embedding in embeddings_list:
+        #     distances, indexes = powerPostgre.search_from_gbdfl_faiss(faiss_index, embedding, 1, threshold)
+        #     if indexes is not None and distances[0][0] > float(threshold)/100:
+        #         # print("FIRST PRINT FROM insert to db:", distances, indexes)
+        #         ids = tuple(list(map(str,indexes[0])))
+        #         similarity = float(distances[0])
+        #         with_zeros = []
+        #         str_ids = list(map(str, indexes[0]))
+        #         for i in str_ids:
+        #             while len(i) < 9:
+        #                 i = "0" + i
+        #             with_zeros.append(i)
+        #         from_gbdfl = powerPostgre.get_info_from_unique_ud_gr(tuple(with_zeros))
+        #         # from_gbdfl = powerPostgre.get_blob_from_ud_gr(ud_code)
+        #         result_dict = {}
 
-                    result_dict['similarity'] = int(round(similarity*100, 2))  # format(from_gbdfl['lst'][1], '.2f')
-                    result_dict['iin'] = from_gbdfl[0]
-                    result_dict['surname'] = from_gbdfl[1]
-                    result_dict['firstname'] = from_gbdfl[2]
-                    if from_gbdfl[3] is None:
-                        result_dict['secondname'] = ''
-                    else:
-                        result_dict['secondname'] = from_gbdfl[3]
+        #         if len(from_gbdfl) > 0:                    
+        #             image_path = os.path.join(FLAGS.crops_folder, original_image_id + '_' + str(face_cnt) + '.jpg')
+        #             img = cv2.imread(image_path)
+
+        #             result_dict['similarity'] = int(round(similarity*100, 2))  # format(from_gbdfl['lst'][1], '.2f')
+        #             result_dict['iin'] = from_gbdfl[0]
+        #             result_dict['surname'] = from_gbdfl[1]
+        #             result_dict['firstname'] = from_gbdfl[2]
+        #             if from_gbdfl[3] is None:
+        #                 result_dict['secondname'] = ''
+        #             else:
+        #                 result_dict['secondname'] = from_gbdfl[3]
                     
-                    result_dict['ud_number'] = from_gbdfl[4]
-                    crop_time = datetime.now()
-                    result_dict['timestamp'] = crop_time
-                    print(result_dict)
-                    strimg = base64.b64encode(cv2.imencode('.jpg', img)[1]).decode()
-                    producer_data = {'app': 'detection',
-                                    'command': 'new_face_detected',
-                                    'crop': strimg,
-                                    'meta': result_dict,
-                                    'source': camera_id,
-                                    'timestamp_sent': datetime.now().strftime("%d-%m-%Y, %H:%M:%S")
-                                    }
-                    # headers = {'User-Agent': 'Mozilla/5.0'}
-                    # to_azat = requests.post('http://10.150.34.13:10100/api/detect-faces-live-ready', headers=headers, data={'data': json.dumps(producer_data, default = defaultconverter)})
-                    # from_azat = json.loads(to_azat.text)
-                    # print(from_azat)
-                    thread = clientThread(send_to_front, [producer_data])
-                    thread.start()
-                    thread.join()
-                else:
-                    print('Not in database')
-                    continue
-                log_message = {'rtsp': camera_id, 'message': 'Successfully sent', 'table_name': 'fr.unique_ud_gr', 'ud_code': with_zeros, 'time_spent': time.time() - start}
-                log.debug(log_message)
-            else:
-                print('Not PASSED THRESHOLD', distances, indexes, 'TIME SPENT:', time.time() - start)
-                log_message = {'rtsp': camera_id, 'message': 'Person Not in Database', 'table_name': 'fr.unique_ud_gr', 'ud_code': None}
-                log.debug(log_message)
+        #             result_dict['ud_number'] = from_gbdfl[4]
+        #             crop_time = datetime.now()
+        #             result_dict['timestamp'] = crop_time
+        #             print(result_dict)
+        #             strimg = base64.b64encode(cv2.imencode('.jpg', img)[1]).decode()
+        #             producer_data = {'app': 'detection',
+        #                             'command': 'new_face_detected',
+        #                             'crop': strimg,
+        #                             'meta': result_dict,
+        #                             'source': camera_id,
+        #                             'timestamp_sent': datetime.now().strftime("%d-%m-%Y, %H:%M:%S")
+        #                             }
+        #             # headers = {'User-Agent': 'Mozilla/5.0'}
+        #             # to_azat = requests.post('http://10.150.34.13:10100/api/detect-faces-live-ready', headers=headers, data={'data': json.dumps(producer_data, default = defaultconverter)})
+        #             # from_azat = json.loads(to_azat.text)
+        #             # print(from_azat)
+        #             thread = clientThread(send_to_front, [producer_data])
+        #             thread.start()
+        #             thread.join()
+        #         else:
+        #             print('Not in database')
+        #             continue
+        #         log_message = {'rtsp': camera_id, 'message': 'Successfully sent', 'table_name': 'fr.unique_ud_gr', 'ud_code': with_zeros, 'time_spent': time.time() - start}
+        #         log.debug(log_message)
+        #     else:
+        #         print('Not PASSED THRESHOLD', distances, indexes, 'TIME SPENT:', time.time() - start)
+        #         log_message = {'rtsp': camera_id, 'message': 'Person Not in Database', 'table_name': 'fr.unique_ud_gr', 'ud_code': None}
+        #         log.debug(log_message)
+        #     face_cnt += 1
 
 
 if __name__ == "__main__":
